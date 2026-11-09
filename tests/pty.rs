@@ -557,8 +557,12 @@ fn a_clean_shell_round_trip_uses_a_real_tty() {
                 session.take();
             }
             Ok(PtyEvent::Error(error)) => panic!("{error}"),
-            Ok(PtyEvent::Resized { .. } | PtyEvent::ReplayComplete) => {
-                panic!("Direct PTYs must not emit session replay events")
+            Ok(
+                PtyEvent::Resized { .. }
+                | PtyEvent::ReplayComplete
+                | PtyEvent::CommandUnconfirmed(_),
+            ) => {
+                panic!("Direct PTYs must not emit hosted session events")
             }
             Err(async_channel::TryRecvError::Closed) => break,
             Err(async_channel::TryRecvError::Empty) => {
@@ -670,8 +674,12 @@ fn a_discovered_cmd_shell_round_trip_uses_conpty() {
                 exited = true;
                 session.take();
             }
-            Ok(PtyEvent::Resized { .. } | PtyEvent::ReplayComplete) => {
-                panic!("Direct PTYs must not emit session replay events")
+            Ok(
+                PtyEvent::Resized { .. }
+                | PtyEvent::ReplayComplete
+                | PtyEvent::CommandUnconfirmed(_),
+            ) => {
+                panic!("Direct PTYs must not emit hosted session events")
             }
             Err(async_channel::TryRecvError::Closed) => break,
             Err(async_channel::TryRecvError::Empty) => {

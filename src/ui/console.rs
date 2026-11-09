@@ -497,6 +497,11 @@ impl Console {
                                     PtyEvent::Exited(status) => {
                                         this.finish_process(status, cx);
                                     }
+                                    PtyEvent::CommandUnconfirmed(error) => {
+                                        if this.session.is_some() {
+                                            this.status = Some(Status::Input(error));
+                                        }
+                                    }
                                     PtyEvent::Error(error) => {
                                         this.replaying = false;
                                         this.status = Some(Status::Connection(error));
@@ -645,8 +650,10 @@ impl Console {
         self.transmitted.push(bytes.to_vec());
         self.cursor_on = true;
         if let Some(session) = &self.session {
-            if let Err(error) = session.write(bytes) {
-                self.status = Some(Status::Input(error));
+            match session.write(bytes) {
+                Err(error) => self.status = Some(Status::Input(error)),
+                Ok(()) if matches!(self.status, Some(Status::Input(_))) => self.status = None,
+                Ok(()) => {}
             }
             self.buffer.term.scroll_display(Scroll::Bottom);
             self.buffer.term.selection = None;

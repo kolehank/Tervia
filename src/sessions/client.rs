@@ -158,10 +158,21 @@ fn request(
     metadata: &Value,
     mut value: Value,
 ) -> io::Result<Value> {
+    exchange(stream, metadata, &mut value).and_then(accepted)
+}
+
+fn exchange(
+    stream: &mut BufReader<TcpStream>,
+    metadata: &Value,
+    value: &mut Value,
+) -> io::Result<Value> {
     value["version"] = json!(VERSION);
     value["token"] = metadata["token"].clone();
-    host::reply(stream.get_mut(), &value)?;
-    let response = host::packet(stream)?;
+    host::reply(stream.get_mut(), value)?;
+    host::packet(stream)
+}
+
+fn accepted(response: Value) -> io::Result<Value> {
     if response["ok"] != true {
         return Err(io::Error::other(
             response["error"]
@@ -220,6 +231,23 @@ fn attach(
     }
 }
 
+fn reattach(
+    directory: &Path,
+    meta: &Value,
+    stop: &AtomicBool,
+) -> io::Result<Option<BufReader<TcpStream>>> {
+    while !stop.load(Ordering::Acquire) {
+        // Keep the host's current palette and the GUI's existing journal reader.
+        match attach(directory, meta, &[]) {
+            Ok((stream, _)) => return Ok(stream),
+            Err(_) if directory.join("finished.json").is_file() => break,
+            Err(error) if has_exited(directory, crate::process::has_exited) => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(400)),
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn connect(directory: &Path, colors: &[[u8; 3]]) -> io::Result<Opened> {
     let meta = metadata(directory)?;
     let (mut stream, response) = attach(directory, &meta, colors)?;
@@ -248,8 +276,8 @@ pub(super) fn connect(directory: &Path, colors: &[[u8; 3]]) -> io::Result<Opened
         let meta = meta.clone();
         std::thread::spawn(move || {
             // Drain accepted input/resize requests before releasing the lease, even if the GUI has detached.
-            loop {
-                let command = match commands.recv_timeout(Duration::from_millis(400)) {
+            'commands: loop {
+                let mut command = match commands.recv_timeout(Duration::from_millis(400)) {
                     Ok(command) => command,
                     Err(mpsc::RecvTimeoutError::Timeout) => Command {
                         value: json!({"op":"status"}),
@@ -257,7 +285,37 @@ pub(super) fn connect(directory: &Path, colors: &[[u8; 3]]) -> io::Result<Opened
                     },
                     Err(_) => break,
                 };
-                let result = request(&mut stream, &meta, command.value);
+                let result = loop {
+                    let error = match exchange(&mut stream, &meta, &mut command.value) {
+                        Ok(response) => break accepted(response),
+                        Err(error) => error,
+                    };
+                    // The host must release the old socket's lease before accepting another attach.
+                    drop(stream);
+                    let operation = command.value["op"].as_str().unwrap_or_default();
+                    // Input may already have executed. Retrying it could run a command twice.
+                    let retry = matches!(operation, "status" | "resize" | "colors");
+                    if !retry {
+                        deliver(
+                            &events,
+                            PtyEvent::CommandUnconfirmed(format!(
+                                "Terminal did not acknowledge {operation}: {error}"
+                            )),
+                            &stop,
+                        );
+                    }
+                    stream = match reattach(&directory, &meta, &stop) {
+                        Ok(Some(socket)) => socket,
+                        Ok(None) => break 'commands,
+                        Err(error) => {
+                            deliver(&events, PtyEvent::Error(error.to_string()), &stop);
+                            break 'commands;
+                        }
+                    };
+                    if !retry {
+                        continue 'commands;
+                    }
+                };
                 if let Some(snapshot) = crate::agent::activity::read(&directory) {
                     *activity.lock().unwrap() = Some(snapshot);
                 }
@@ -346,6 +404,106 @@ fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_disconnect_reattaches_the_existing_connection() {
+        use std::net::TcpListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let meta = json!({"version":VERSION,"port":listener.local_addr().unwrap().port(),"token":"mock-token"});
+        runtime::write_private(&root.path().join("endpoint.json"), &meta).unwrap();
+        let mut journal = journal::Journal::create(&root.path().join("output")).unwrap();
+        journal.append(0, b"mock-before").unwrap();
+        let boundary = journal.length;
+        let (reattached, attached) = mpsc::channel();
+        let (received, input) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let accept = |length| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("Expected a control socket: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket);
+                let attach = host::packet(&mut reader).unwrap();
+                assert_eq!(attach["op"], "attach");
+                assert_eq!(attach["token"], "mock-token");
+                host::reply(reader.get_mut(), &json!({"ok":true,"length":length})).unwrap();
+                reader
+            };
+            let read_input = |reader: &mut BufReader<TcpStream>| loop {
+                let command = host::packet(reader).unwrap();
+                if command["op"] == "input" {
+                    break command["bytes"].clone();
+                }
+                assert_eq!(command["op"], "status");
+                host::reply(reader.get_mut(), &json!({"ok":true})).unwrap();
+            };
+
+            let mut first = accept(boundary);
+            assert_eq!(host::packet(&mut first).unwrap()["op"], "status");
+            drop(first);
+            journal.append(0, b"mock-during-disconnect").unwrap();
+
+            let mut second = accept(journal.length);
+            reattached.send(()).unwrap();
+            assert_eq!(read_input(&mut second), json!(b"mock-unconfirmed"));
+            drop(second);
+
+            let mut third = accept(journal.length);
+            received.send(read_input(&mut third)).unwrap();
+            host::reply(third.get_mut(), &json!({"ok":true})).unwrap();
+        });
+
+        let (session, events, _) = connect(root.path(), &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut before = false;
+        let mut replayed = false;
+        let mut during = false;
+        while !during {
+            assert!(Instant::now() < deadline, "Missing output after disconnect");
+            match events.try_recv() {
+                Ok(PtyEvent::Data(bytes)) if bytes == b"mock-before" => {
+                    assert!(!before && !replayed);
+                    before = true;
+                }
+                Ok(PtyEvent::ReplayComplete) => {
+                    assert!(before && !replayed);
+                    replayed = true;
+                }
+                Ok(PtyEvent::Data(bytes)) if bytes == b"mock-during-disconnect" => during = true,
+                Ok(PtyEvent::Error(error)) => panic!("Unexpected connection error: {error}"),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(replayed);
+        attached.recv_timeout(Duration::from_secs(5)).unwrap();
+        session.write(b"mock-unconfirmed").unwrap();
+        session.write(b"mock-input").unwrap();
+        assert_eq!(
+            input.recv_timeout(Duration::from_secs(5)).unwrap(),
+            json!(b"mock-input")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(PtyEvent::CommandUnconfirmed(_))
+        ));
+        server.join().unwrap();
+    }
 
     #[test]
     fn attach_errors_without_a_finished_marker_remain_errors() {

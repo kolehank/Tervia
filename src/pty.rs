@@ -19,6 +19,7 @@ pub enum PtyEvent {
     Resized { columns: usize, rows: usize },
     ReplayComplete,
     Exited(String),
+    CommandUnconfirmed(String),
     Error(String),
 }
 

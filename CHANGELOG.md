@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.19.3 (2026-11-09)
+
+### Fixes
+
+- **terminal:** reconnect live sessions after a dropped connection (a789b7b7)
+
 ## v0.19.2 (2026-10-30)
 
 ### Fixes
